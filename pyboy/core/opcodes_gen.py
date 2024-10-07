@@ -26,6 +26,7 @@ logger = pyboy.logging.get_logger(__name__)
 FLAGC, FLAGH, FLAGN, FLAGZ = range(4, 8)
 
 def BRK(cpu):
+    cpu.bail = True
     cpu.mb.breakpoint_singlestep = 1
     cpu.mb.breakpoint_singlestep_latch = 0
     # NOTE: We do not increment PC
@@ -34,11 +35,14 @@ def BRK(cpu):
 """
 
 cimports = """
-from . cimport cpu
 cimport cython
 from libc.stdint cimport uint8_t, uint16_t, uint32_t
 
 from pyboy.logging.logging cimport Logger
+
+from . cimport cpu
+
+
 cdef Logger logger
 
 cdef uint16_t FLAGC, FLAGH, FLAGN, FLAGZ
@@ -264,7 +268,7 @@ class Code:
         if not self.branch_op:
             self.lines.append("cpu.PC += %d" % self.length)
             self.lines.append("cpu.PC &= 0xFFFF")
-            self.lines.append("return " + self.cycles[0]) # Choose the 0th cycle count
+            self.lines.append("cpu.cycles += " + self.cycles[0]) # Choose the 0th cycle count
 
         code += "\n\t".join(self.lines)
 
@@ -459,7 +463,8 @@ class OpcodeData:
         # TODO: Implement HALT bug.
         code.addlines([
             "cpu.halted = True",
-            "return " + self.cycles[0],
+            "cpu.bail = True",
+            "cpu.cycles += " + self.cycles[0],
         ])
         return code.getcode()
 
@@ -470,7 +475,10 @@ class OpcodeData:
 
     def EI(self):
         code = Code(self.name.split()[0], self.opcode, self.name, 0, self.length, self.cycles)
-        code.addline("cpu.interrupt_master_enable = True")
+        code.addlines([
+            "cpu.interrupt_master_enable = True",
+            "cpu.bail = (cpu.interrupts_flag_register & 0b11111) & (cpu.interrupts_enabled_register & 0b11111)",
+        ])
         return code.getcode()
 
     def DI(self):
@@ -552,6 +560,24 @@ class OpcodeData:
         code = Code(
             self.name.split()[0], self.opcode, self.name, left.immediate or right.immediate, self.length, self.cycles
         )
+
+        # These opcodes can be observed reading mid-cycle
+        if self.opcode == 0x36:
+            code.addline("cpu.cycles += 4")
+            code.cycles = (str(int(code.cycles[0]) - 4), )
+        elif self.opcode == 0xE0:
+            code.addline("cpu.cycles += 4")
+            code.cycles = (str(int(code.cycles[0]) - 4), )
+        elif self.opcode == 0xEA:
+            code.addline("cpu.cycles += 8")
+            code.cycles = (str(int(code.cycles[0]) - 8), )
+        elif self.opcode == 0xF0:
+            code.addline("cpu.cycles += 4")
+            code.cycles = (str(int(code.cycles[0]) - 4), )
+        elif self.opcode == 0xFA:
+            code.addline("cpu.cycles += 8")
+            code.cycles = (str(int(code.cycles[0]) - 8), )
+
         if self.is16bit and left.immediate and left.pointer:
             code.addline(left.set % ("%s & 0xFF" % right.get))
             a, b = left.set.split(",")
@@ -657,6 +683,13 @@ class OpcodeData:
             self.name.split()[0], self.opcode, self.name, left.immediate or right.immediate, self.length, self.cycles
         )
         code.addlines(self.ALU(left, right, "+"))
+
+        if self.opcode == 0x34:
+            # HACK: Offset the timing by 4 cycles
+            # TODO: Probably should be generalized
+            code.lines.insert(-1, "cpu.cycles += 4") # Inject before read
+            code.cycles = ("8", ) # 12 - 4
+
         return code.getcode()
 
     def DEC(self):
@@ -668,6 +701,13 @@ class OpcodeData:
             self.name.split()[0], self.opcode, self.name, left.immediate or right.immediate, self.length, self.cycles
         )
         code.addlines(self.ALU(left, right, "-"))
+
+        if self.opcode == 0x35:
+            # HACK: Offset the timing by 4 cycles
+            # TODO: Probably should be generalized
+            code.lines.insert(-1, "cpu.cycles += 4") # Inject before write
+            code.cycles = ("8", ) # 12 - 4
+
         return code.getcode()
 
     def ADC(self):
@@ -853,16 +893,16 @@ class OpcodeData:
             self.name.split()[0], self.opcode, self.name, right.immediate, self.length, self.cycles, branch_op=True
         )
         if left is None:
-            code.addlines(["cpu.PC = %s" % ("v" if right.immediate else r_code), "return " + self.cycles[0]])
+            code.addlines(["cpu.PC = %s" % ("v" if right.immediate else r_code), "cpu.cycles += " + self.cycles[0]])
         else:
             code.addlines([
                 "if %s:" % l_code,
                 "\tcpu.PC = %s" % ("v" if right.immediate else r_code),
-                "\treturn " + self.cycles[0],
+                "\tcpu.cycles += " + self.cycles[0],
                 "else:",
                 "\tcpu.PC += %s" % self.length,
                 "\tcpu.PC &= 0xFFFF",
-                "\treturn " + self.cycles[1],
+                "\tcpu.cycles += " + self.cycles[1],
             ])
 
         return code.getcode()
@@ -892,7 +932,7 @@ class OpcodeData:
             code.addlines([
                 "cpu.PC += %d + " % self.length + inline_signed_int8("v"),
                 "cpu.PC &= 0xFFFF",
-                "return " + self.cycles[0],
+                "cpu.cycles += " + self.cycles[0],
             ])
         else:
             code.addlines([
@@ -900,10 +940,10 @@ class OpcodeData:
                 "if %s:" % l_code,
                 "\tcpu.PC += " + inline_signed_int8("v"),
                 "\tcpu.PC &= 0xFFFF",
-                "\treturn " + self.cycles[0],
+                "\tcpu.cycles += " + self.cycles[0],
                 "else:",
                 "\tcpu.PC &= 0xFFFF",
-                "\treturn " + self.cycles[1],
+                "\tcpu.cycles += " + self.cycles[1],
             ])
 
         return code.getcode()
@@ -943,7 +983,7 @@ class OpcodeData:
                 "cpu.SP -= 2",
                 "cpu.SP &= 0xFFFF",
                 "cpu.PC = %s" % ("v" if right.immediate else right.get),
-                "return " + self.cycles[0],
+                "cpu.cycles += " + self.cycles[0],
             ])
         else:
             code.addlines([
@@ -953,9 +993,9 @@ class OpcodeData:
                 "\tcpu.SP -= 2",
                 "\tcpu.SP &= 0xFFFF",
                 "\tcpu.PC = %s" % ("v" if right.immediate else right.get),
-                "\treturn " + self.cycles[0],
+                "\tcpu.cycles += " + self.cycles[0],
                 "else:",
-                "\treturn " + self.cycles[1],
+                "\tcpu.cycles += " + self.cycles[1],
             ])
 
         return code.getcode()
@@ -981,7 +1021,7 @@ class OpcodeData:
                 "cpu.PC |= cpu.mb.getitem(cpu.SP) # Low",
                 "cpu.SP += 2",
                 "cpu.SP &= 0xFFFF",
-                "return " + self.cycles[0],
+                "cpu.cycles += " + self.cycles[0],
             ])
         else:
             code.addlines([
@@ -990,24 +1030,25 @@ class OpcodeData:
                 "\tcpu.PC |= cpu.mb.getitem(cpu.SP) # Low",
                 "\tcpu.SP += 2",
                 "\tcpu.SP &= 0xFFFF",
-                "\treturn " + self.cycles[0],
+                "\tcpu.cycles += " + self.cycles[0],
                 "else:",
                 "\tcpu.PC += %s" % self.length,
                 "\tcpu.PC &= 0xFFFF",
-                "\treturn " + self.cycles[1],
+                "\tcpu.cycles += " + self.cycles[1],
             ])
 
         return code.getcode()
 
     def RETI(self):
         code = Code(self.name.split()[0], self.opcode, self.name, False, self.length, self.cycles, branch_op=True)
-        code.addline("cpu.interrupt_master_enable = True")
         code.addlines([
+            "cpu.interrupt_master_enable = True",
+            "cpu.bail = (cpu.interrupts_flag_register & 0b11111) & (cpu.interrupts_enabled_register & 0b11111)",
             "cpu.PC = cpu.mb.getitem((cpu.SP + 1) & 0xFFFF) << 8 # High",
             "cpu.PC |= cpu.mb.getitem(cpu.SP) # Low",
             "cpu.SP += 2",
             "cpu.SP &= 0xFFFF",
-            "return " + self.cycles[0],
+            "cpu.cycles += " + self.cycles[0],
         ])
 
         return code.getcode()
@@ -1030,7 +1071,7 @@ class OpcodeData:
 
         code.addlines([
             "cpu.PC = %s" % (right.code),
-            "return " + self.cycles[0],
+            "cpu.cycles += " + self.cycles[0],
         ])
 
         return code.getcode()
@@ -1049,6 +1090,14 @@ class OpcodeData:
         code.addlines(self.handleflags8bit(left.get, None, None, throughcarry))
         code.addline("t &= 0xFF")
         left.assign = True
+
+        if left.operand == "(HL)":
+            # HACK: Offset the timing by 4 cycles
+            # TODO: Probably should be generalized
+            code.lines.insert(0, "cpu.cycles += 4") # Inject before read
+            code.addline("cpu.cycles += 4")
+            code.cycles = ("8", ) # 16 - 4 - 4
+
         code.addline(left.set % "t")
         return code
 
@@ -1086,6 +1135,14 @@ class OpcodeData:
             code.addline("t = (%s >> 1) + ((%s & 1) << 7)" % (left.get, left.get) + " + ((%s & 1) << 8)" % (left.get))
         code.addlines(self.handleflags8bit(left.get, None, None, throughcarry))
         code.addline("t &= 0xFF")
+
+        if left.operand == "(HL)":
+            # HACK: Offset the timing by 4 cycles
+            # TODO: Probably should be generalized
+            code.lines.insert(0, "cpu.cycles += 4") # Inject before read
+            code.addline("cpu.cycles += 4")
+            code.cycles = ("8", ) # 16 - 4 - 4
+
         code.addline(left.set % "t")
         return code
 
@@ -1118,6 +1175,14 @@ class OpcodeData:
         code.addline("t = (%s << 1)" % left.get)
         code.addlines(self.handleflags8bit(left.get, None, None, False))
         code.addline("t &= 0xFF")
+
+        if left.operand == "(HL)":
+            # HACK: Offset the timing by 4 cycles
+            # TODO: Probably should be generalized
+            code.lines.insert(0, "cpu.cycles += 4") # Inject before read
+            code.addline("cpu.cycles += 4")
+            code.cycles = ("8", ) # 16 - 4 - 4
+
         code.addline(left.set % "t")
         return code.getcode()
 
@@ -1131,6 +1196,14 @@ class OpcodeData:
         code.addline("t = ((%s >> 1) | (%s & 0x80)) + ((%s & 1) << 8)" % (left.get, left.get, left.get))
         code.addlines(self.handleflags8bit(left.get, None, None, False))
         code.addline("t &= 0xFF")
+
+        if left.operand == "(HL)":
+            # HACK: Offset the timing by 4 cycles
+            # TODO: Probably should be generalized
+            code.lines.insert(0, "cpu.cycles += 4") # Inject before read
+            code.addline("cpu.cycles += 4")
+            code.cycles = ("8", ) # 16 - 4 - 4
+
         code.addline(left.set % "t")
         return code.getcode()
 
@@ -1142,6 +1215,14 @@ class OpcodeData:
         code.addline("t = (%s >> 1) + ((%s & 1) << 8)" % (left.get, left.get))
         code.addlines(self.handleflags8bit(left.get, None, None, False))
         code.addline("t &= 0xFF")
+
+        if left.operand == "(HL)":
+            # HACK: Offset the timing by 4 cycles
+            # TODO: Probably should be generalized
+            code.lines.insert(0, "cpu.cycles += 4") # Inject before read
+            code.addline("cpu.cycles += 4")
+            code.cycles = ("8", ) # 16 - 4 - 4
+
         code.addline(left.set % "t")
         return code.getcode()
 
@@ -1152,6 +1233,14 @@ class OpcodeData:
         code.addline("t = ((%s & 0xF0) >> 4) | ((%s & 0x0F) << 4)" % (left.get, left.get))
         code.addlines(self.handleflags8bit(left.get, None, None, False))
         code.addline("t &= 0xFF")
+
+        if left.operand == "(HL)":
+            # HACK: Offset the timing by 4 cycles
+            # TODO: Probably should be generalized
+            code.lines.insert(0, "cpu.cycles += 4") # Inject before read
+            code.addline("cpu.cycles += 4")
+            code.cycles = ("8", ) # 16 - 4 - 4
+
         code.addline(left.set % "t")
         return code.getcode()
 
@@ -1164,6 +1253,14 @@ class OpcodeData:
         left = Literal(r0)
         right = Operand(r1)
         code = Code(self.name.split()[0], self.opcode, self.name, False, self.length, self.cycles)
+
+        # FIX: Correct cycle count is 12, not 16!
+        if right.operand == "(HL)":
+            # HACK: Offset the timing by 4 cycles
+            # TODO: Probably should be generalized
+            code.addline("cpu.cycles += 4")
+            code.cycles = ("8", ) # 12 - 4
+
         code.addline("t = %s & (1 << %s)" % (right.get, left.get))
         code.addlines(self.handleflags8bit(left.get, right.get, None, False))
 
@@ -1176,6 +1273,14 @@ class OpcodeData:
 
         code = Code(self.name.split()[0], self.opcode, self.name, False, self.length, self.cycles)
         code.addline("t = %s & ~(1 << %s)" % (right.get, left.get))
+
+        if right.operand == "(HL)":
+            # HACK: Offset the timing by 4 cycles
+            # TODO: Probably should be generalized
+            code.lines.insert(0, "cpu.cycles += 4") # Inject before read
+            code.addline("cpu.cycles += 4")
+            code.cycles = ("8", ) # 16 - 4 - 4
+
         code.addline(right.set % "t")
         return code.getcode()
 
@@ -1185,6 +1290,14 @@ class OpcodeData:
         right = Operand(r1)
         code = Code(self.name.split()[0], self.opcode, self.name, False, self.length, self.cycles)
         code.addline("t = %s | (1 << %s)" % (right.get, left.get))
+
+        if right.operand == "(HL)":
+            # HACK: Offset the timing by 4 cycles
+            # TODO: Probably should be generalized
+            code.lines.insert(0, "cpu.cycles += 4") # Inject before read
+            code.addline("cpu.cycles += 4")
+            code.cycles = ("8", ) # 16 - 4 - 4
+
         code.addline(right.set % "t")
         return code.getcode()
 

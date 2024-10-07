@@ -13,6 +13,7 @@ import time
 
 import numpy as np
 
+from pyboy.api.gameshark import GameShark
 from pyboy.api.memory_scanner import MemoryScanner
 from pyboy.api.screen import Screen
 from pyboy.api.tilemap import TileMap
@@ -50,6 +51,7 @@ class PyBoy:
         sound=False,
         sound_emulated=False,
         cgb=None,
+        gameshark=None,
         log_level=defaults["log_level"],
         **kwargs
     ):
@@ -158,9 +160,8 @@ class PyBoy:
                 raise KeyError(f"Unknown keyword argument: {k}")
 
         # Performance measures
-        self.avg_pre = 0
         self.avg_tick = 0
-        self.avg_post = 0
+        self.avg_emu = 0
 
         # Absolute frame count of the emulation
         self.frame_count = 0
@@ -355,16 +356,30 @@ class PyBoy:
             A game-specific wrapper object.
         """
 
+        self.gameshark = GameShark(self.memory)
+        """
+        Provides an instance of the `pyboy.api.gameshark.GameShark` handler. This allows you to inject GameShark-based cheat codes.
+
+        Example:
+        ```python
+        >>> pyboy.gameshark.add("010138CD")
+        >>> pyboy.gameshark.remove("010138CD")
+        >>> pyboy.gameshark.clear_all()
+        ```
+        """
+        if gameshark:
+            for code in gameshark.split(","):
+                self.gameshark.add(code.strip())
+
         self.initialized = True
 
     def _tick(self, render):
         if self.stopped:
             return False
 
-        t_start = time.perf_counter_ns()
         self._handle_events(self.events)
-        t_pre = time.perf_counter_ns()
         if not self.paused:
+            self.gameshark.tick()
             self.__rendering(render)
             # Reenter mb.tick until we eventually get a clean exit without breakpoints
             while self.mb.tick():
@@ -389,18 +404,7 @@ class PyBoy:
                     self.mb.breakpoint_singlestep = self.mb.breakpoint_singlestep_latch
 
             self.frame_count += 1
-        t_tick = time.perf_counter_ns()
-        self._post_tick()
-        t_post = time.perf_counter_ns()
-
-        nsecs = t_pre - t_start
-        self.avg_pre = 0.9 * self.avg_pre + (0.1*nsecs/1_000_000_000)
-
-        nsecs = t_tick - t_pre
-        self.avg_tick = 0.9 * self.avg_tick + (0.1*nsecs/1_000_000_000)
-
-        nsecs = t_post - t_tick
-        self.avg_post = 0.9 * self.avg_post + (0.1*nsecs/1_000_000_000)
+            self._post_handle_events()
 
         return not self.quitting
 
@@ -449,11 +453,22 @@ class PyBoy:
             False if emulation has ended otherwise True
         """
 
+        _count = count
         running = False
+        t_start = time.perf_counter_ns()
         while count != 0:
             _render = render and count == 1 # Only render on last tick to improve performance
             running = self._tick(_render)
             count -= 1
+        t_tick = time.perf_counter_ns()
+        self._post_tick()
+        t_post = time.perf_counter_ns()
+
+        if _count > 0:
+            nsecs = t_tick - t_start
+            self.avg_tick = 0.9 * (self.avg_tick / _count) + (0.1*nsecs/1_000_000_000)
+            nsecs = t_post - t_start
+            self.avg_emu = 0.9 * (self.avg_emu / _count) + (0.1*nsecs/1_000_000_000)
         return running
 
     def _handle_events(self, events):
@@ -520,6 +535,7 @@ class PyBoy:
         self._plugin_manager.post_tick()
         self._plugin_manager.frame_limiter(self.target_emulationspeed)
 
+    def _post_handle_events(self):
         # Prepare an empty list, as the API might be used to send in events between ticks
         self.events = []
         while self.queued_input and self.frame_count == self.queued_input[0][0]:
@@ -527,9 +543,8 @@ class PyBoy:
             self.events.append(WindowEvent(_event))
 
     def _update_window_title(self):
-        avg_emu = self.avg_pre + self.avg_tick + self.avg_post
-        self.window_title = f"CPU/frame: {(self.avg_pre + self.avg_tick) / SPF * 100:0.2f}%"
-        self.window_title += f' Emulation: x{(round(SPF / avg_emu) if avg_emu > 0 else "INF")}'
+        self.window_title = f"CPU/frame: {(self.avg_tick) / SPF * 100:0.2f}%"
+        self.window_title += f' Emulation: x{(round(SPF / self.avg_emu) if self.avg_emu > 0 else "INF")}'
         if self.paused:
             self.window_title += "[PAUSED]"
         self.window_title += self._plugin_manager.window_title()
@@ -970,7 +985,8 @@ class PyBoy:
 
         A `target_speed` of `0` means unlimited. I.e. fastest possible execution.
 
-        Some window types do not implement a frame-limiter, and will always run at full speed.
+        Due to backwards compatibility, the null window starts at unlimited speed (i.e. `target_speed=0`), while
+        others start at realtime (i.e. `target_speed=1`).
 
         Example:
         ```python
@@ -984,11 +1000,6 @@ class PyBoy:
         Args:
             target_speed (int): Target emulation speed as multiplier of real-time.
         """
-        if self.initialized and self._plugin_manager.window_null_enabled:
-            logger.warning(
-                'This window type does not support frame-limiting. `pyboy.set_emulation_speed(...)` will have no effect, as it\'s always running at full speed.'
-            )
-
         if target_speed > 5:
             logger.warning("The emulation speed might not be accurate when speed-target is higher than 5")
         self.target_emulationspeed = target_speed
@@ -1398,14 +1409,14 @@ class PyBoyMemoryView:
     """
     This class cannot be used directly, but is accessed through `PyBoy.memory`.
 
-    This class serves four purposes: Reading memory (ROM/RAM), writing memory (ROM/RAM), overriding memory (ROM/RAM) and special registers.
+    This class serves four purposes: Reading memory (ROM/RAM), writing memory (RAM), overriding memory (ROM) and special registers.
 
     See the [Pan Docs: Memory Map](https://gbdev.io/pandocs/Memory_Map.html) for a great overview of the memory space.
 
     Memory can be accessed as individual bytes (`pyboy.memory[0x00]`) or as slices (`pyboy.memory[0x00:0x10]`). And if
     applicable, a specific ROM/RAM bank can be defined before the address (`pyboy.memory[0, 0x00]` or `pyboy.memory[0, 0x00:0x10]`).
 
-    The boot ROM is accessed using the special "-1" ROM bank.
+    The boot ROM is accessed using the special `-1` ROM bank.
 
     The find addresses of interest, either search online for something like: "[game title] RAM map", or find them yourself
     using `PyBoy.memory_scanner`.
@@ -1414,6 +1425,8 @@ class PyBoyMemoryView:
 
     If you're developing a bot or AI with this API, you're most likely going to be using read the most. This is how you
     would efficiently read the score, time, coins, positions etc. in a game's memory.
+
+    At this point, all reads will return a new list of the values in the given range. The slices will not reference back to the PyBoy memory. This feature might come in the future.
 
     ```python
     >>> pyboy.memory[0x0000] # Read one byte at address 0x0000
@@ -1441,8 +1454,6 @@ class PyBoyMemoryView:
     (`pyboy.memory[2, 0xA000]=1`). Without defining the bank, PyBoy will pick the current bank for the given address if
     needed (`pyboy.memory[0xA000]=1`).
 
-    At this point, all reads will return a new list of the values in the given range. The slices will not reference back to the PyBoy memory. This feature might come in the future.
-
     ```python
     >>> pyboy.memory[0xC000] = 123 # Write to WRAM at address 0xC000
     >>> pyboy.memory[0xC000:0xC00A] = [0,1,2,3,4,5,6,7,8,9] # Write to WRAM from address 0xC000 to 0xC00A
@@ -1460,7 +1471,7 @@ class PyBoyMemoryView:
 
     This can be used to reprogram a game ROM to change its behavior.
 
-    This will not let your override RAM or a special register. This will let you override data in the ROM at any given bank.
+    This will not let you override RAM or a special register. This will let you override data in the ROM at any given bank.
     This is the memory allocated at 0x0000 to 0x8000, where 0x4000 to 0x8000 can be changed from the MBC.
 
     _NOTE_: Any changes here are not saved or loaded to game states! Use this function with caution and reapply

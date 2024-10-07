@@ -15,6 +15,8 @@ import pyboy
 
 logger = pyboy.logging.get_logger(__name__)
 
+MAX_CYCLES = 1 << 16
+
 
 class Motherboard:
     def __init__(
@@ -276,11 +278,8 @@ class Motherboard:
     def tick(self):
         while self.processing_frame():
             if self.cgb and self.hdma.transfer_active and self.lcd._STAT._mode & 0b11 == 0:
-                cycles = self.hdma.tick(self)
+                self.cpu.cycles = self.cpu.cycles + self.hdma.tick(self)
             else:
-                cycles = self.cpu.tick()
-
-            if self.cpu.halted:
                 # Fast-forward to next interrupt:
                 # As we are halted, we are guaranteed, that our state
                 # cannot be altered by other factors than time.
@@ -288,35 +287,32 @@ class Motherboard:
                 # it gets triggered mid-frame or by next frame
                 # Serial is not implemented, so this isn't a concern
 
-                # Help Cython with types
-                mode0_cycles = 1 << 32
+                mode0_cycles = MAX_CYCLES
                 if self.cgb and self.hdma.transfer_active:
                     mode0_cycles = self.lcd.cycles_to_mode0()
 
-                cycles = max(
-                    0,
+                cycles_target = max(
+                    4,
                     min(
-                        self.lcd.cycles_to_interrupt(),
-                        self.timer.cycles_to_interrupt(),
+                        self.timer._cycles_to_interrupt,
+                        self.lcd._cycles_to_interrupt, # TODO: Be more agreesive. Only if actual interrupt enabled.
+                        self.lcd._cycles_to_frame,
+                        self.sound._cycles_to_interrupt, # TODO: Not implemented
                         # self.serial.cycles_to_interrupt(),
                         mode0_cycles
                     )
                 )
+                self.cpu.tick(cycles_target)
 
             #TODO: Support General Purpose DMA
             # https://gbdev.io/pandocs/CGB_Registers.html#bit-7--0---general-purpose-dma
 
-            # TODO: Unify interface
-            sclock = self.sound.clock
-            if self.cgb and self.double_speed:
-                self.sound.clock = sclock + cycles//2
-            else:
-                self.sound.clock = sclock + cycles
+            self.sound.tick(self.cpu.cycles, self.double_speed)
 
-            if self.timer.tick(cycles):
+            if self.timer.tick(self.cpu.cycles):
                 self.cpu.set_interruptflag(INTR_TIMER)
 
-            lcd_interrupt = self.lcd.tick(cycles)
+            lcd_interrupt = self.lcd.tick(self.cpu.cycles)
             if lcd_interrupt:
                 self.cpu.set_interruptflag(lcd_interrupt)
 
@@ -350,8 +346,7 @@ class Motherboard:
             bank_offset = 0
             if self.cgb and 0xD000 <= i:
                 # Find which bank to read from at FF70
-                bank = self.getitem(0xFF70)
-                bank &= 0b111
+                bank = self.ram.non_io_internal_ram1[0xFF70 - 0xFF4C] & 0b111
                 if bank == 0x0:
                     bank = 0x01
                 bank_offset = (bank-1) * 0x1000
@@ -364,6 +359,10 @@ class Motherboard:
         elif 0xFEA0 <= i < 0xFF00: # Empty but unusable for I/O
             return self.ram.non_io_internal_ram0[i - 0xFEA0]
         elif 0xFF00 <= i < 0xFF4C: # I/O ports
+            # NOTE: A bit ad-hoc, but interrupts can occur right between writes
+            if self.timer.tick(self.cpu.cycles):
+                self.cpu.set_interruptflag(INTR_TIMER)
+
             if i == 0xFF04:
                 return self.timer.DIV
             elif i == 0xFF05:
@@ -375,6 +374,7 @@ class Motherboard:
             elif i == 0xFF0F:
                 return self.cpu.interrupts_flag_register
             elif 0xFF10 <= i < 0xFF40:
+                self.sound.tick(self.cpu.cycles, self.double_speed)
                 return self.sound.get(i - 0xFF10)
             elif i == 0xFF40:
                 return self.lcd.get_lcdc()
@@ -442,9 +442,11 @@ class Motherboard:
         if 0x0000 <= i < 0x4000: # 16kB ROM bank #0
             # Doesn't change the data. This is for MBC commands
             self.cartridge.setitem(i, value)
+            self.cpu.bail = True
         elif 0x4000 <= i < 0x8000: # 16kB switchable ROM bank
             # Doesn't change the data. This is for MBC commands
             self.cartridge.setitem(i, value)
+            self.cpu.bail = True
         elif 0x8000 <= i < 0xA000: # 8kB Video RAM
             if not self.cgb or self.lcd.vbk.active_bank == 0:
                 self.lcd.VRAM0[i - 0x8000] = value
@@ -475,6 +477,10 @@ class Motherboard:
         elif 0xFEA0 <= i < 0xFF00: # Empty but unusable for I/O
             self.ram.non_io_internal_ram0[i - 0xFEA0] = value
         elif 0xFF00 <= i < 0xFF4C: # I/O ports
+            # NOTE: A bit ad-hoc, but interrupts can occur right between writes
+            if self.timer.tick(self.cpu.cycles):
+                self.cpu.set_interruptflag(INTR_TIMER)
+
             if i == 0xFF00:
                 self.ram.io_ports[i - 0xFF00] = self.interaction.pull(value)
             elif i == 0xFF01:
@@ -493,6 +499,7 @@ class Motherboard:
             elif i == 0xFF0F:
                 self.cpu.interrupts_flag_register = value
             elif 0xFF10 <= i < 0xFF40:
+                self.sound.tick(self.cpu.cycles, self.double_speed)
                 self.sound.set(i - 0xFF10, value)
             elif i == 0xFF40:
                 self.lcd.set_lcdc(value)
@@ -526,13 +533,16 @@ class Motherboard:
                 self.lcd.WX = value
             else:
                 self.ram.io_ports[i - 0xFF00] = value
+            self.cpu.bail = True
         elif 0xFF4C <= i < 0xFF80: # Empty but unusable for I/O
             if self.bootrom_enabled and i == 0xFF50 and (value == 0x1 or value == 0x11):
                 logger.debug("Bootrom disabled!")
                 self.bootrom_enabled = False
+                self.cpu.bail = True
             # CGB registers
             elif self.cgb and i == 0xFF4D:
                 self.key1 = value
+                self.cpu.bail = True
             elif self.cgb and i == 0xFF4F:
                 self.lcd.vbk.set(value)
             elif self.cgb and i == 0xFF51:
@@ -545,6 +555,7 @@ class Motherboard:
                 self.hdma.hdma4 = value # & 0xF0
             elif self.cgb and i == 0xFF55:
                 self.hdma.set_hdma5(value, self)
+                self.cpu.bail = True
             elif self.cgb and i == 0xFF68:
                 self.lcd.bcps.set(value)
             elif self.cgb and i == 0xFF69:
@@ -563,6 +574,7 @@ class Motherboard:
             self.ram.internal_ram1[i - 0xFF80] = value
         elif i == 0xFFFF: # Interrupt Enable Register
             self.cpu.interrupts_enabled_register = value
+            self.cpu.bail = True
         # else:
         #     logger.critical("Memory access violation. Tried to write: 0x%0.2x to 0x%0.4x", value, i)
 

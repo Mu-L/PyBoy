@@ -68,7 +68,7 @@ from .pyboy import PyBoy, PyBoyMemoryView, PyBoyRegisterFile</code></pre>
 <dl>
 <dt id="pyboy.PyBoy"><code class="flex name class">
 <span>class <span class="ident">PyBoy</span></span>
-<span>(</span><span>gamerom, *, window='SDL2', scale=3, symbols=None, bootrom=None, sound=False, sound_emulated=False, cgb=None, log_level='ERROR', **kwargs)</span>
+<span>(</span><span>gamerom, *, window='SDL2', scale=3, symbols=None, bootrom=None, sound=False, sound_emulated=False, cgb=None, gameshark=None, log_level='ERROR', **kwargs)</span>
 </code></dt>
 <dd>
 <section class="desc"><p>PyBoy is loadable as an object in Python. This means, it can be initialized from another script, and be
@@ -121,6 +121,7 @@ True...
         sound=False,
         sound_emulated=False,
         cgb=None,
+        gameshark=None,
         log_level=defaults[&#34;log_level&#34;],
         **kwargs
     ):
@@ -229,9 +230,8 @@ True...
                 raise KeyError(f&#34;Unknown keyword argument: {k}&#34;)
 
         # Performance measures
-        self.avg_pre = 0
         self.avg_tick = 0
-        self.avg_post = 0
+        self.avg_emu = 0
 
         # Absolute frame count of the emulation
         self.frame_count = 0
@@ -426,16 +426,30 @@ True...
             A game-specific wrapper object.
         &#34;&#34;&#34;
 
+        self.gameshark = GameShark(self.memory)
+        &#34;&#34;&#34;
+        Provides an instance of the `pyboy.api.gameshark.GameShark` handler. This allows you to inject GameShark-based cheat codes.
+
+        Example:
+        ```python
+        &gt;&gt;&gt; pyboy.gameshark.add(&#34;010138CD&#34;)
+        &gt;&gt;&gt; pyboy.gameshark.remove(&#34;010138CD&#34;)
+        &gt;&gt;&gt; pyboy.gameshark.clear_all()
+        ```
+        &#34;&#34;&#34;
+        if gameshark:
+            for code in gameshark.split(&#34;,&#34;):
+                self.gameshark.add(code.strip())
+
         self.initialized = True
 
     def _tick(self, render):
         if self.stopped:
             return False
 
-        t_start = time.perf_counter_ns()
         self._handle_events(self.events)
-        t_pre = time.perf_counter_ns()
         if not self.paused:
+            self.gameshark.tick()
             self.__rendering(render)
             # Reenter mb.tick until we eventually get a clean exit without breakpoints
             while self.mb.tick():
@@ -460,18 +474,7 @@ True...
                     self.mb.breakpoint_singlestep = self.mb.breakpoint_singlestep_latch
 
             self.frame_count += 1
-        t_tick = time.perf_counter_ns()
-        self._post_tick()
-        t_post = time.perf_counter_ns()
-
-        nsecs = t_pre - t_start
-        self.avg_pre = 0.9 * self.avg_pre + (0.1*nsecs/1_000_000_000)
-
-        nsecs = t_tick - t_pre
-        self.avg_tick = 0.9 * self.avg_tick + (0.1*nsecs/1_000_000_000)
-
-        nsecs = t_post - t_tick
-        self.avg_post = 0.9 * self.avg_post + (0.1*nsecs/1_000_000_000)
+            self._post_handle_events()
 
         return not self.quitting
 
@@ -520,11 +523,22 @@ True...
             False if emulation has ended otherwise True
         &#34;&#34;&#34;
 
+        _count = count
         running = False
+        t_start = time.perf_counter_ns()
         while count != 0:
             _render = render and count == 1 # Only render on last tick to improve performance
             running = self._tick(_render)
             count -= 1
+        t_tick = time.perf_counter_ns()
+        self._post_tick()
+        t_post = time.perf_counter_ns()
+
+        if _count &gt; 0:
+            nsecs = t_tick - t_start
+            self.avg_tick = 0.9 * (self.avg_tick / _count) + (0.1*nsecs/1_000_000_000)
+            nsecs = t_post - t_start
+            self.avg_emu = 0.9 * (self.avg_emu / _count) + (0.1*nsecs/1_000_000_000)
         return running
 
     def _handle_events(self, events):
@@ -591,6 +605,7 @@ True...
         self._plugin_manager.post_tick()
         self._plugin_manager.frame_limiter(self.target_emulationspeed)
 
+    def _post_handle_events(self):
         # Prepare an empty list, as the API might be used to send in events between ticks
         self.events = []
         while self.queued_input and self.frame_count == self.queued_input[0][0]:
@@ -598,9 +613,8 @@ True...
             self.events.append(WindowEvent(_event))
 
     def _update_window_title(self):
-        avg_emu = self.avg_pre + self.avg_tick + self.avg_post
-        self.window_title = f&#34;CPU/frame: {(self.avg_pre + self.avg_tick) / SPF * 100:0.2f}%&#34;
-        self.window_title += f&#39; Emulation: x{(round(SPF / avg_emu) if avg_emu &gt; 0 else &#34;INF&#34;)}&#39;
+        self.window_title = f&#34;CPU/frame: {(self.avg_tick) / SPF * 100:0.2f}%&#34;
+        self.window_title += f&#39; Emulation: x{(round(SPF / self.avg_emu) if self.avg_emu &gt; 0 else &#34;INF&#34;)}&#39;
         if self.paused:
             self.window_title += &#34;[PAUSED]&#34;
         self.window_title += self._plugin_manager.window_title()
@@ -1041,7 +1055,8 @@ True...
 
         A `target_speed` of `0` means unlimited. I.e. fastest possible execution.
 
-        Some window types do not implement a frame-limiter, and will always run at full speed.
+        Due to backwards compatibility, the null window starts at unlimited speed (i.e. `target_speed=0`), while
+        others start at realtime (i.e. `target_speed=1`).
 
         Example:
         ```python
@@ -1055,11 +1070,6 @@ True...
         Args:
             target_speed (int): Target emulation speed as multiplier of real-time.
         &#34;&#34;&#34;
-        if self.initialized and self._plugin_manager.window_null_enabled:
-            logger.warning(
-                &#39;This window type does not support frame-limiting. `pyboy.set_emulation_speed(...)` will have no effect, as it\&#39;s always running at full speed.&#39;
-            )
-
         if target_speed &gt; 5:
             logger.warning(&#34;The emulation speed might not be accurate when speed-target is higher than 5&#34;)
         self.target_emulationspeed = target_speed
@@ -1494,6 +1504,15 @@ game title (see <code><a title="pyboy.PyBoy.cartridge_title" href="#pyboy.PyBoy.
 <p><code><a title="pyboy.plugins.base_plugin.PyBoyGameWrapper" href="plugins/base_plugin.html#pyboy.plugins.base_plugin.PyBoyGameWrapper">PyBoyGameWrapper</a></code>:
 A game-specific wrapper object.</p></section>
 </dd>
+<dt id="pyboy.PyBoy.gameshark"><code class="name">var <span class="ident">gameshark</span></code></dt>
+<dd>
+<section class="desc"><p>Provides an instance of the <code><a title="pyboy.api.gameshark.GameShark" href="api/gameshark.html#pyboy.api.gameshark.GameShark">GameShark</a></code> handler. This allows you to inject GameShark-based cheat codes.</p>
+<p>Example:</p>
+<pre><code class="language-python">&gt;&gt;&gt; pyboy.gameshark.add(&quot;010138CD&quot;)
+&gt;&gt;&gt; pyboy.gameshark.remove(&quot;010138CD&quot;)
+&gt;&gt;&gt; pyboy.gameshark.clear_all()
+</code></pre></section>
+</dd>
 </dl>
 <h3>Methods</h3>
 <dl>
@@ -1586,11 +1605,22 @@ False if emulation has ended otherwise True</p></section>
         False if emulation has ended otherwise True
     &#34;&#34;&#34;
 
+    _count = count
     running = False
+    t_start = time.perf_counter_ns()
     while count != 0:
         _render = render and count == 1 # Only render on last tick to improve performance
         running = self._tick(_render)
         count -= 1
+    t_tick = time.perf_counter_ns()
+    self._post_tick()
+    t_post = time.perf_counter_ns()
+
+    if _count &gt; 0:
+        nsecs = t_tick - t_start
+        self.avg_tick = 0.9 * (self.avg_tick / _count) + (0.1*nsecs/1_000_000_000)
+        nsecs = t_post - t_start
+        self.avg_emu = 0.9 * (self.avg_emu / _count) + (0.1*nsecs/1_000_000_000)
     return running</code></pre>
 </details>
 </dd>
@@ -2343,7 +2373,8 @@ that is built-in with the game wrapper plugin for your game. See <code><a title=
 <code>target_speed</code>.</p>
 <p>The speed is defined as a multiple of real-time. I.e <code>target_speed=2</code> is double speed.</p>
 <p>A <code>target_speed</code> of <code>0</code> means unlimited. I.e. fastest possible execution.</p>
-<p>Some window types do not implement a frame-limiter, and will always run at full speed.</p>
+<p>Due to backwards compatibility, the null window starts at unlimited speed (i.e. <code>target_speed=0</code>), while
+others start at realtime (i.e. <code>target_speed=1</code>).</p>
 <p>Example:</p>
 <pre><code class="language-python">&gt;&gt;&gt; pyboy.tick() # Delays 16.67ms
 True
@@ -2369,7 +2400,8 @@ True
 
     A `target_speed` of `0` means unlimited. I.e. fastest possible execution.
 
-    Some window types do not implement a frame-limiter, and will always run at full speed.
+    Due to backwards compatibility, the null window starts at unlimited speed (i.e. `target_speed=0`), while
+    others start at realtime (i.e. `target_speed=1`).
 
     Example:
     ```python
@@ -2383,11 +2415,6 @@ True
     Args:
         target_speed (int): Target emulation speed as multiplier of real-time.
     &#34;&#34;&#34;
-    if self.initialized and self._plugin_manager.window_null_enabled:
-        logger.warning(
-            &#39;This window type does not support frame-limiting. `pyboy.set_emulation_speed(...)` will have no effect, as it\&#39;s always running at full speed.&#39;
-        )
-
     if target_speed &gt; 5:
         logger.warning(&#34;The emulation speed might not be accurate when speed-target is higher than 5&#34;)
     self.target_emulationspeed = target_speed</code></pre>
@@ -2862,16 +2889,17 @@ the game.</p>
 </code></dt>
 <dd>
 <section class="desc"><p>This class cannot be used directly, but is accessed through <code><a title="pyboy.PyBoy.memory" href="#pyboy.PyBoy.memory">PyBoy.memory</a></code>.</p>
-<p>This class serves four purposes: Reading memory (ROM/RAM), writing memory (ROM/RAM), overriding memory (ROM/RAM) and special registers.</p>
+<p>This class serves four purposes: Reading memory (ROM/RAM), writing memory (RAM), overriding memory (ROM) and special registers.</p>
 <p>See the <a href="https://gbdev.io/pandocs/Memory_Map.html">Pan Docs: Memory Map</a> for a great overview of the memory space.</p>
 <p>Memory can be accessed as individual bytes (<code>pyboy.memory[0x00]</code>) or as slices (<code>pyboy.memory[0x00:0x10]</code>). And if
 applicable, a specific ROM/RAM bank can be defined before the address (<code>pyboy.memory[0, 0x00]</code> or <code>pyboy.memory[0, 0x00:0x10]</code>).</p>
-<p>The boot ROM is accessed using the special "-1" ROM bank.</p>
+<p>The boot ROM is accessed using the special <code>-1</code> ROM bank.</p>
 <p>The find addresses of interest, either search online for something like: "[game title] RAM map", or find them yourself
 using <code><a title="pyboy.PyBoy.memory_scanner" href="#pyboy.PyBoy.memory_scanner">PyBoy.memory_scanner</a></code>.</p>
 <p><strong>Read:</strong></p>
 <p>If you're developing a bot or AI with this API, you're most likely going to be using read the most. This is how you
 would efficiently read the score, time, coins, positions etc. in a game's memory.</p>
+<p>At this point, all reads will return a new list of the values in the given range. The slices will not reference back to the PyBoy memory. This feature might come in the future.</p>
 <pre><code class="language-python">&gt;&gt;&gt; pyboy.memory[0x0000] # Read one byte at address 0x0000
 49
 &gt;&gt;&gt; pyboy.memory[0x0000:0x0010] # Read 16 bytes from 0x0000 to 0x0010 (excluding 0x0010)
@@ -2892,7 +2920,6 @@ sends commands to the <a href="https://gbdev.io/pandocs/MBCs.html#mbcs">Memory B
 <p>A write is done by assigning to the <code><a title="pyboy.PyBoy.memory" href="#pyboy.PyBoy.memory">PyBoy.memory</a></code> object. It's recommended to define the bank to avoid mistakes
 (<code>pyboy.memory[2, 0xA000]=1</code>). Without defining the bank, PyBoy will pick the current bank for the given address if
 needed (<code>pyboy.memory[0xA000]=1</code>).</p>
-<p>At this point, all reads will return a new list of the values in the given range. The slices will not reference back to the PyBoy memory. This feature might come in the future.</p>
 <pre><code class="language-python">&gt;&gt;&gt; pyboy.memory[0xC000] = 123 # Write to WRAM at address 0xC000
 &gt;&gt;&gt; pyboy.memory[0xC000:0xC00A] = [0,1,2,3,4,5,6,7,8,9] # Write to WRAM from address 0xC000 to 0xC00A
 &gt;&gt;&gt; pyboy.memory[0xC010:0xC01A] = 0 # Write to WRAM from address 0xC010 to 0xC01A
@@ -2905,7 +2932,7 @@ needed (<code>pyboy.memory[0xA000]=1</code>).</p>
 <p><strong>Override:</strong></p>
 <p>Override data at a given memory address of the Game Boy's ROM.</p>
 <p>This can be used to reprogram a game ROM to change its behavior.</p>
-<p>This will not let your override RAM or a special register. This will let you override data in the ROM at any given bank.
+<p>This will not let you override RAM or a special register. This will let you override data in the ROM at any given bank.
 This is the memory allocated at 0x0000 to 0x8000, where 0x4000 to 0x8000 can be changed from the MBC.</p>
 <p><em>NOTE</em>: Any changes here are not saved or loaded to game states! Use this function with caution and reapply
 any overrides when reloading the ROM.</p>
@@ -2937,14 +2964,14 @@ used as a source of randomness in games. If you read the value, you'll get a pse
     &#34;&#34;&#34;
     This class cannot be used directly, but is accessed through `PyBoy.memory`.
 
-    This class serves four purposes: Reading memory (ROM/RAM), writing memory (ROM/RAM), overriding memory (ROM/RAM) and special registers.
+    This class serves four purposes: Reading memory (ROM/RAM), writing memory (RAM), overriding memory (ROM) and special registers.
 
     See the [Pan Docs: Memory Map](https://gbdev.io/pandocs/Memory_Map.html) for a great overview of the memory space.
 
     Memory can be accessed as individual bytes (`pyboy.memory[0x00]`) or as slices (`pyboy.memory[0x00:0x10]`). And if
     applicable, a specific ROM/RAM bank can be defined before the address (`pyboy.memory[0, 0x00]` or `pyboy.memory[0, 0x00:0x10]`).
 
-    The boot ROM is accessed using the special &#34;-1&#34; ROM bank.
+    The boot ROM is accessed using the special `-1` ROM bank.
 
     The find addresses of interest, either search online for something like: &#34;[game title] RAM map&#34;, or find them yourself
     using `PyBoy.memory_scanner`.
@@ -2953,6 +2980,8 @@ used as a source of randomness in games. If you read the value, you'll get a pse
 
     If you&#39;re developing a bot or AI with this API, you&#39;re most likely going to be using read the most. This is how you
     would efficiently read the score, time, coins, positions etc. in a game&#39;s memory.
+
+    At this point, all reads will return a new list of the values in the given range. The slices will not reference back to the PyBoy memory. This feature might come in the future.
 
     ```python
     &gt;&gt;&gt; pyboy.memory[0x0000] # Read one byte at address 0x0000
@@ -2980,8 +3009,6 @@ used as a source of randomness in games. If you read the value, you'll get a pse
     (`pyboy.memory[2, 0xA000]=1`). Without defining the bank, PyBoy will pick the current bank for the given address if
     needed (`pyboy.memory[0xA000]=1`).
 
-    At this point, all reads will return a new list of the values in the given range. The slices will not reference back to the PyBoy memory. This feature might come in the future.
-
     ```python
     &gt;&gt;&gt; pyboy.memory[0xC000] = 123 # Write to WRAM at address 0xC000
     &gt;&gt;&gt; pyboy.memory[0xC000:0xC00A] = [0,1,2,3,4,5,6,7,8,9] # Write to WRAM from address 0xC000 to 0xC00A
@@ -2999,7 +3026,7 @@ used as a source of randomness in games. If you read the value, you'll get a pse
 
     This can be used to reprogram a game ROM to change its behavior.
 
-    This will not let your override RAM or a special register. This will let you override data in the ROM at any given bank.
+    This will not let you override RAM or a special register. This will let you override data in the ROM at any given bank.
     This is the memory allocated at 0x0000 to 0x8000, where 0x4000 to 0x8000 can be changed from the MBC.
 
     _NOTE_: Any changes here are not saved or loaded to game states! Use this function with caution and reapply
@@ -3611,6 +3638,7 @@ def PC(self):
 <li><code><a title="pyboy.PyBoy.tilemap_window" href="#pyboy.PyBoy.tilemap_window">tilemap_window</a></code></li>
 <li><code><a title="pyboy.PyBoy.cartridge_title" href="#pyboy.PyBoy.cartridge_title">cartridge_title</a></code></li>
 <li><code><a title="pyboy.PyBoy.game_wrapper" href="#pyboy.PyBoy.game_wrapper">game_wrapper</a></code></li>
+<li><code><a title="pyboy.PyBoy.gameshark" href="#pyboy.PyBoy.gameshark">gameshark</a></code></li>
 </ul>
 </li>
 <li>

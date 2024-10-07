@@ -163,14 +163,14 @@ for _ in range(target):
 
 ```python
 for _ in range(target//15):
-    pyboy.tick(15, True)
+    pyboy.tick(15)
 
 ```
 </td>
 <td >
 
 ```python
-pyboy.tick(target)
+pyboy.tick(target, False)
 
 ```
 </td>
